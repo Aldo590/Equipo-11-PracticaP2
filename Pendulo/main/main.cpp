@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -6,6 +7,7 @@
 #include "driver/ledc.h"
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
+#include "esp_adc/adc_oneshot.h" // NUEVA librería ADC para ESP-IDF v5+
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -19,12 +21,18 @@ static const char *TAG = "MOTOR_CONTROL";
 #define PIN_IN2      GPIO_NUM_21
 #define PIN_ENC_A    GPIO_NUM_26
 #define PIN_ENC_B    GPIO_NUM_27
+#define PIN_SENSOR_IR GPIO_NUM_32 // Pin del sensor infrarrojo
+
+// Configuración del ACS712
+#define PIN_SENSOR_CORRIENTE ADC_CHANNEL_6   // Equivale al GPIO 34 en la nueva API
+#define ACS_SENSIBILIDAD    0.185f           // Sensibilidad modelo 5A (0.185 V/A)
+#define ACS_VOLTAJE_CERO    2.335f             // Voltaje con 0 Amperios (Mitad de 5V)
 
 #define PWM_FREQ_HZ  20000
 #define PWM_RES      LEDC_TIMER_10_BIT
 #define PWM_MAX      1023
 
-#define PULSOS_POR_REV_4X 937.0f
+#define PULSOS_POR_REV_4X 937.0f // Valor calibrado de la caja reductora
 #define MAX_RPM           330.0f
 #define TIEMPO_TOTAL_CICLO 10.0f
 #define TIEMPO_PAUSA       2.0f
@@ -35,8 +43,10 @@ static const char *TAG = "MOTOR_CONTROL";
 // ==========================================
 typedef enum {
     ESTADO_DETENIDO,
-    ESTADO_ESPERANDO,
-    ESTADO_CORRIENDO
+    ESTADO_ESPERANDO_CURVA,
+    ESTADO_CORRIENDO_CURVA,
+    ESTADO_HOMING,        // Buscando el sensor IR
+    ESTADO_POSICION       // Manteniendo posición (grados)
 } EstadoMotor_t;
 
 volatile EstadoMotor_t estado_motor = ESTADO_DETENIDO;
@@ -50,24 +60,32 @@ typedef enum {
 volatile PerfilVelocidad_t perfilSeleccionado = TRAPEZOIDAL;
 volatile PerfilVelocidad_t perfilActual = TRAPEZOIDAL;
 
-// Variables PID
-float Kp = 1.5f;
-float Ki = 4.0f;
-float Kd = 0.02f;
-float errorIntegral = 0;
+volatile long posicion_global_pulsos = 0; 
+volatile float grados_objetivo = 0.0f;
+
+float corrienteFiltrada = 0.0f;
+
+float Kp_vel = 1.5f;
+float Ki_vel = 4.0f;
+float Kd_vel = 0.02f;
+float errorIntegral_vel = 0;
 float rpmFiltrada = 0;
 float rpmPrevia = 0;
 const float ALPHA_FILTRO = 0.3f;
 
+float Kp_pos = 5.0f;  
+float Kd_pos = 0.5f;  
+float errorPrevio_pos = 0;
+
 pcnt_unit_handle_t pcnt_unit = NULL;
+adc_oneshot_unit_handle_t adc1_handle = NULL; // Manejador global del ADC
 
 // ==========================================
-// PERFILES MATEMÁTICOS
+// PERFILES MATEMÁTICOS DE VELOCIDAD
 // ==========================================
 float evaluarPerfil(PerfilVelocidad_t perfil, float t, float t_final) {
     float p0 = 0.0f;
     float p_max = 280.0f;
-
     switch (perfil) {
         case CONSTANTE:     return 200.0f;
         case RAMPA_LINEAL:  return p0 + ((p_max - p0) / t_final) * t;
@@ -97,8 +115,24 @@ void init_hardware() {
     io_conf.mode = GPIO_MODE_OUTPUT;
     io_conf.pin_bit_mask = (1ULL << PIN_IN1) | (1ULL << PIN_IN2);
     gpio_config(&io_conf);
-    
     gpio_set_level(PIN_IN1, 0); gpio_set_level(PIN_IN2, 0);
+
+    gpio_config_t ir_conf = {};
+    ir_conf.intr_type = GPIO_INTR_DISABLE;
+    ir_conf.mode = GPIO_MODE_INPUT;
+    ir_conf.pin_bit_mask = (1ULL << PIN_SENSOR_IR);
+    ir_conf.pull_up_en = GPIO_PULLUP_ENABLE; 
+    gpio_config(&ir_conf);
+
+    // NUEVA INICIALIZACIÓN DEL ADC (ESP-IDF v5+)
+    adc_oneshot_unit_init_cfg_t init_config = {};
+    init_config.unit_id = ADC_UNIT_1;
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config = {};
+    config.atten = ADC_ATTEN_DB_12; // Rango hasta ~3.3V
+    config.bitwidth = ADC_BITWIDTH_12; // Resolución 0-4095
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, PIN_SENSOR_CORRIENTE, &config));
 
     ledc_timer_config_t ledc_timer = {};
     ledc_timer.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -169,75 +203,104 @@ void control_motor_task(void *pvParameter) {
         
         if (dt >= (INTERVALO_PID_MS / 1000.0f)) {
             tiempoUltimoPID_us = tiempoActual_us;
-            float objetivo = 0.0f;
-
-            // === LÓGICA DE ESTADOS ===
-            if (estado_motor == ESTADO_DETENIDO) {
-                objetivo = 0.0f;
-                tiempoInicioCiclo_us = tiempoActual_us; // Mantener el timer de ciclo a 0
             
-            } else if (estado_motor == ESTADO_ESPERANDO) {
-                objetivo = 0.0f;
-                // Si ya pasaron 3 segundos (3,000,000 microsegundos)
-                if ((tiempoActual_us - tiempoCambio_us) >= 3000000LL) {
-                    estado_motor = ESTADO_CORRIENDO;
-                    perfilActual = perfilSeleccionado;
-                    tiempoInicioCiclo_us = tiempoActual_us; // Comienza el ciclo en t=0
-                    printf(">Info: ¡Arrancando motor!\n");
-                }
+            int pulsos_delta = 0;
+            ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulsos_delta));
+            ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit)); 
+            posicion_global_pulsos += pulsos_delta; 
             
-            } else if (estado_motor == ESTADO_CORRIENDO) {
-                float t_ciclo = (tiempoActual_us - tiempoInicioCiclo_us) / 1000000.0f;
-                if (t_ciclo <= TIEMPO_TOTAL_CICLO) {
-                    objetivo = evaluarPerfil(perfilActual, t_ciclo, TIEMPO_TOTAL_CICLO);
-                } else if (t_ciclo <= (TIEMPO_TOTAL_CICLO + TIEMPO_PAUSA)) {
-                    objetivo = 0.0f;
-                } else {
-                    tiempoInicioCiclo_us = esp_timer_get_time(); // Reiniciar ciclo
-                }
-            }
-
-            // === LECTURA DE ENCODER Y FILTRO ===
-            int pulsos = 0;
-            ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &pulsos));
-            ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
-
-            float rpmCruda = ((float)pulsos / PULSOS_POR_REV_4X) * (60.0f / dt);
+            float rpmCruda = ((float)pulsos_delta / PULSOS_POR_REV_4X) * (60.0f / dt);
             rpmFiltrada = (ALPHA_FILTRO * rpmCruda) + ((1.0f - ALPHA_FILTRO) * rpmFiltrada);
+            float salidaControl = 0.0f;
 
-            // === CONTROL PID ===
-            float error = objetivo - fabsf(rpmFiltrada);
-            float P = Kp * error;
-            float derivadaMedicion = (fabsf(rpmFiltrada) - fabsf(rpmPrevia)) / dt;
-            float D = -Kd * derivadaMedicion;
-            rpmPrevia = rpmFiltrada;
+            // =======================================================
+            // LECTURA DEL SENSOR DE CORRIENTE ACS712 (NUEVA API)
+            // =======================================================
+            int adcRaw = 0;
+            ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, PIN_SENSOR_CORRIENTE, &adcRaw));
+            float voltajeADC = ((float)adcRaw / 4095.0f) * 3.3f;
+            float corrienteCruda = (voltajeADC - ACS_VOLTAJE_CERO) / ACS_SENSIBILIDAD;
+            corrienteFiltrada = (0.1f * corrienteCruda) + (0.9f * corrienteFiltrada);
+            // =======================================================
 
-            float salidaControl = P + (Ki * errorIntegral) + D;
-
-            if (salidaControl > PWM_MAX) {
-                salidaControl = PWM_MAX;
-                if (error < 0) errorIntegral += error * dt;
-            } else if (salidaControl < -PWM_MAX) {
-                salidaControl = -PWM_MAX;
-                if (error > 0) errorIntegral += error * dt;
-            } else {
-                errorIntegral += error * dt;
+            if (estado_motor == ESTADO_DETENIDO) {
+                salidaControl = 0.0f;
+                errorIntegral_vel = 0;
+            } 
+            else if (estado_motor == ESTADO_ESPERANDO_CURVA) {
+                salidaControl = 0.0f;
+                if ((tiempoActual_us - tiempoCambio_us) >= 3000000LL) {
+                    estado_motor = ESTADO_CORRIENDO_CURVA;
+                    perfilActual = perfilSeleccionado;
+                    tiempoInicioCiclo_us = tiempoActual_us;
+                    errorIntegral_vel = 0.0f; 
+                    printf(">Info: ¡Arrancando curva de velocidad!\n");
+                }
+            } 
+            else if (estado_motor == ESTADO_CORRIENDO_CURVA) {
+                float t_ciclo = (tiempoActual_us - tiempoInicioCiclo_us) / 1000000.0f;
+                float rpmObjetivo = 0.0f;
+                
+                if (t_ciclo <= TIEMPO_TOTAL_CICLO) {
+                    rpmObjetivo = evaluarPerfil(perfilActual, t_ciclo, TIEMPO_TOTAL_CICLO);
+                } else if (t_ciclo <= (TIEMPO_TOTAL_CICLO + TIEMPO_PAUSA)) {
+                    rpmObjetivo = 0.0f;
+                } else {
+                    tiempoInicioCiclo_us = esp_timer_get_time();
+                    errorIntegral_vel = 0.0f; 
+                }
+                
+                float error = rpmObjetivo - fabsf(rpmFiltrada);
+                float P = Kp_vel * error;
+                float D = -Kd_vel * ((fabsf(rpmFiltrada) - fabsf(rpmPrevia)) / dt);
+                rpmPrevia = rpmFiltrada;
+                
+                salidaControl = P + (Ki_vel * errorIntegral_vel) + D;
+                
+                float PWM_MINIMO = 120.0f; 
+                if (rpmObjetivo > 0.0f && fabsf(rpmFiltrada) < 5.0f && salidaControl > 0.0f) salidaControl += PWM_MINIMO;
+                if (salidaControl > PWM_MAX) { salidaControl = PWM_MAX; if (error < 0) errorIntegral_vel += error * dt; } 
+                else if (salidaControl < -PWM_MAX) { salidaControl = -PWM_MAX; if (error > 0) errorIntegral_vel += error * dt; } 
+                else { errorIntegral_vel += error * dt; }
+                
+                printf(">RPM_Obj:%.2f\n", rpmObjetivo);
+                printf(">RPM_Real:%.2f\n", fabsf(rpmFiltrada));
             }
+            else if (estado_motor == ESTADO_HOMING) {
+                if (gpio_get_level(PIN_SENSOR_IR) == 1) { 
+                    salidaControl = 600.0f; 
+                } else {
+                    posicion_global_pulsos = 0; 
+                    salidaControl = 0.0f;
+                    estado_motor = ESTADO_POSICION;
+                    grados_objetivo = 0.0f; 
+                    errorPrevio_pos = 0.0f; 
+                    printf(">Info: ¡Homing Completo! Centro establecido (0 grados).\n");
+                }
+            }
+            else if (estado_motor == ESTADO_POSICION) {
+                long pulsos_objetivo = (long)((grados_objetivo / 360.0f) * PULSOS_POR_REV_4X);
+                long error_pos = pulsos_objetivo - posicion_global_pulsos;
+                
+                float P = Kp_pos * (float)error_pos;
+                float D = Kd_pos * ((float)(error_pos - errorPrevio_pos) / dt);
+                errorPrevio_pos = error_pos;
+                
+                salidaControl = P + D;
+                
+                if (salidaControl > PWM_MAX) salidaControl = PWM_MAX;
+                if (salidaControl < -PWM_MAX) salidaControl = -PWM_MAX;
 
-            // Parada total limpia sin acumular integral
-            if (objetivo == 0.0f && fabsf(rpmFiltrada) < 2.0f) {
-                salidaControl = 0;
-                errorIntegral = 0;
+                float grados_actuales = ((float)posicion_global_pulsos / PULSOS_POR_REV_4X) * 360.0f;
+                printf(">Grados_Obj:%.2f\n", grados_objetivo);
+                printf(">Grados_Real:%.2f\n", grados_actuales);
             }
 
             aplicarMotorPWM((int)salidaControl);
             
-            // Envío a Teleplot (solo grafica si está corriendo, si no manda 0 para gráfica limpia)
-            printf(">Objetivo:%.2f\n", objetivo);
-            printf(">RPM_Real:%.2f\n", fabsf(rpmFiltrada));
-            printf(">PWM:%.2f\n", salidaControl);
+            printf(">PWM_Salida:%.2f\n", salidaControl);
+            printf(">Corriente:%.2f\n", corrienteFiltrada); 
         }
-
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -247,44 +310,47 @@ void control_motor_task(void *pvParameter) {
 // ==========================================
 void lectura_serial_task(void *pvParameter) {
     char linea[32];
-    
-    // Imprimir el menú al arrancar (se muestra en la terminal de Teleplot)
-    printf("\n>Info: === CONTROL DE MOTOR LISTO ===\n");
-    printf(">Info: Comandos disponibles:\n");
-    printf(">Info: [1-9] Selecciona perfil y arranca en 3s\n");
-    printf(">Info: [s] o [0] Detener de emergencia\n");
-    printf(">Info: Estado inicial: DETENIDO.\n\n");
+    printf("\n>Info: === SISTEMA PRINCIPAL (CON SENSOR CORRIENTE ACS712) ===\n");
+    printf(">Info: [1-9] Ejecutar curva de Velocidad\n");
+    printf(">Info: [h]   Ejecutar Homing (Busca centro IR)\n");
+    printf(">Info: [p45] Ir a Posicion 45 grados (Usa p+Numero)\n");
+    printf(">Info: [s]   Detener emergencia\n\n");
 
     while (1) {
-        // Se queda bloqueado aquí esperando a que escribas y presiones Enter
         if (fgets(linea, sizeof(linea), stdin) != NULL) {
             char comando = linea[0];
             
             if (comando >= '1' && comando <= '9') {
                 perfilSeleccionado = (PerfilVelocidad_t)(comando - '1');
                 tiempoCambio_us = esp_timer_get_time();
-                estado_motor = ESTADO_ESPERANDO;
-                printf(">Info: Curva %c solicitada. Arrancando en 3 segundos...\n", comando);
-                
-            } else if (comando == 's' || comando == 'S' || comando == '0') {
+                estado_motor = ESTADO_ESPERANDO_CURVA;
+                printf(">Info: Curva %c solicitada. Arrancando en 3s...\n", comando);
+            } 
+            else if (comando == 'h' || comando == 'H') {
+                estado_motor = ESTADO_HOMING;
+                printf(">Info: Iniciando Homing...\n");
+            }
+            else if (comando == 'p' || comando == 'P') {
+                float nuevos_grados = 0;
+                if (sscanf(linea + 1, "%f", &nuevos_grados) == 1) {
+                    grados_objetivo = nuevos_grados;
+                    estado_motor = ESTADO_POSICION;
+                    printf(">Info: Moviendo pendulo a %.2f grados.\n", grados_objetivo);
+                } else {
+                    printf(">Info: Formato incorrecto. Ejemplo: p90\n");
+                }
+            }
+            else if (comando == 's' || comando == 'S' || comando == '0') {
                 estado_motor = ESTADO_DETENIDO;
                 printf(">Info: --- MOTOR DETENIDO DE EMERGENCIA ---\n");
             }
         }
-        // Pequeño descanso para el sistema
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
-// ==========================================
-// FUNCIÓN PRINCIPAL
-// ==========================================
 extern "C" void app_main(void) {
     init_hardware();
-    
-    // Tarea del motor (Core 1, Alta prioridad = 5)
     xTaskCreatePinnedToCore(control_motor_task, "motor_task", 4096, NULL, 5, NULL, 1);
-    
-    // Tarea de lectura serial (Core 0, Baja prioridad = 2)
     xTaskCreatePinnedToCore(lectura_serial_task, "serial_task", 3072, NULL, 2, NULL, 0);
 }
